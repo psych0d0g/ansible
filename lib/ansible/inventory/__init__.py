@@ -1,4 +1,4 @@
-# (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -19,9 +19,10 @@
 
 import fnmatch
 import os
+import sys
 import re
-
 import subprocess
+
 import ansible.constants as C
 from ansible.inventory.ini import InventoryParser
 from ansible.inventory.script import InventoryScript
@@ -38,7 +39,7 @@ class Inventory(object):
 
     __slots__ = [ 'host_list', 'groups', '_restriction', '_also_restriction', '_subset', 
                   'parser', '_vars_per_host', '_vars_per_group', '_hosts_cache', '_groups_list',
-                  '_vars_plugins', '_playbook_basedir']
+                  '_pattern_cache', '_vars_plugins', '_playbook_basedir']
 
     def __init__(self, host_list=C.DEFAULT_HOST_LIST):
 
@@ -53,6 +54,7 @@ class Inventory(object):
         self._vars_per_group = {}
         self._hosts_cache    = {}
         self._groups_list    = {} 
+        self._pattern_cache  = {}
 
         # to be set by calling set_playbook_basedir by ansible-playbook
         self._playbook_basedir = None
@@ -70,28 +72,67 @@ class Inventory(object):
                 host_list = host_list.split(",")
                 host_list = [ h for h in host_list if h and h.strip() ]
 
-        if isinstance(host_list, list):
+        if host_list is None:
+            self.parser = None
+        elif isinstance(host_list, list):
             self.parser = None
             all = Group('all')
             self.groups = [ all ]
+            ipv6_re = re.compile('\[([a-f:A-F0-9]*[%[0-z]+]?)\](?::(\d+))?')
             for x in host_list:
-                if ":" in x:
-                    tokens = x.split(":", 1)
-                    all.add_host(Host(tokens[0], tokens[1]))
+                m = ipv6_re.match(x)
+                if m:
+                    all.add_host(Host(m.groups()[0], m.groups()[1]))
                 else:
-                    all.add_host(Host(x))
+                    if ":" in x:
+                        tokens = x.rsplit(":", 1)
+                        # if there is ':' in the address, then this is a ipv6
+                        if ':' in tokens[0]:
+                            all.add_host(Host(x))
+                        else:
+                            all.add_host(Host(tokens[0], tokens[1]))
+                    else:
+                        all.add_host(Host(x))
         elif os.path.exists(host_list):
             if os.path.isdir(host_list):
                 # Ensure basedir is inside the directory
                 self.host_list = os.path.join(self.host_list, "")
                 self.parser = InventoryDirectory(filename=host_list)
                 self.groups = self.parser.groups.values()
-            elif utils.is_executable(host_list):
-                self.parser = InventoryScript(filename=host_list)
-                self.groups = self.parser.groups.values()
             else:
-                self.parser = InventoryParser(filename=host_list)
-                self.groups = self.parser.groups.values()
+                # check to see if the specified file starts with a
+                # shebang (#!/), so if an error is raised by the parser
+                # class we can show a more apropos error
+                shebang_present = False
+                try:
+                    inv_file = open(host_list)
+                    first_line = inv_file.readlines()[0]
+                    inv_file.close()
+                    if first_line.startswith('#!'):
+                        shebang_present = True
+                except:
+                    pass
+
+                if utils.is_executable(host_list):
+                    try:
+                        self.parser = InventoryScript(filename=host_list)
+                        self.groups = self.parser.groups.values()
+                    except:
+                        if not shebang_present:
+                            raise errors.AnsibleError("The file %s is marked as executable, but failed to execute correctly. " % host_list + \
+                                                      "If this is not supposed to be an executable script, correct this with `chmod -x %s`." % host_list)
+                        else:
+                            raise
+                else:
+                    try:
+                        self.parser = InventoryParser(filename=host_list)
+                        self.groups = self.parser.groups.values()
+                    except:
+                        if shebang_present:
+                            raise errors.AnsibleError("The file %s looks like it should be an executable inventory script, but is not marked executable. " % host_list + \
+                                                      "Perhaps you want to correct this with `chmod +x %s`?" % host_list)
+                        else:
+                            raise
 
             utils.plugins.vars_loader.add_directory(self.basedir(), with_subdir=True)
         else:
@@ -121,7 +162,7 @@ class Inventory(object):
         # exclude hosts not in a subset, if defined
         if self._subset:
             subset = self._get_hosts(self._subset)
-            hosts.intersection_update(subset)
+            hosts = [ h for h in hosts if h in subset ]
 
         # exclude hosts mentioned in any restriction (ex: failed hosts)
         if self._restriction is not None:
@@ -129,7 +170,7 @@ class Inventory(object):
         if self._also_restriction is not None:
             hosts = [ h for h in hosts if h.name in self._also_restriction ]
 
-        return sorted(hosts, key=lambda x: x.name)
+        return hosts
 
     def _get_hosts(self, patterns):
         """
@@ -158,17 +199,18 @@ class Inventory(object):
         # first, then the &s, then the !s.
         patterns = pattern_regular + pattern_intersection + pattern_exclude
 
-        hosts = set()
+        hosts = []
+
         for p in patterns:
+            that = self.__get_hosts(p)
             if p.startswith("!"):
-                # Discard excluded hosts
-                hosts.difference_update(self.__get_hosts(p))
+                hosts = [ h for h in hosts if h not in that ]
             elif p.startswith("&"):
-                # Only leave the intersected hosts
-                hosts.intersection_update(self.__get_hosts(p))
+                hosts = [ h for h in hosts if h in that ]
             else:
-                # Get all hosts from both patterns
-                hosts.update(self.__get_hosts(p))
+                to_append = [ h for h in that if h.name not in [ y.name for y in hosts ] ]
+                hosts.extend(to_append)
+        
         return hosts
 
     def __get_hosts(self, pattern):
@@ -177,11 +219,14 @@ class Inventory(object):
         take into account negative matches.
         """
 
+        if pattern in self._pattern_cache:
+            return self._pattern_cache[pattern]
+
         (name, enumeration_details) = self._enumeration_info(pattern)
         hpat = self._hosts_in_unenumerated_pattern(name)
-        hpat = sorted(hpat, key=lambda x: x.name)
-
-        return set(self._apply_ranges(pattern, hpat))
+        result = self._apply_ranges(pattern, hpat)
+        self._pattern_cache[pattern] = result
+        return result
 
     def _enumeration_info(self, pattern):
         """
@@ -190,15 +235,21 @@ class Inventory(object):
         a tuple of (start, stop) or None
         """
 
-        if not "[" in pattern or pattern.startswith('~'):
-            return (pattern, None)
-        (first, rest) = pattern.split("[")
-        rest = rest.replace("]","")
-        if "-" in rest:
-            (left, right) = rest.split("-",1)
-            return (first, (left, right))
+        # The regex used to match on the range, which can be [x] or [x-y].
+        pattern_re = re.compile("^(.*)\[([-]?[0-9]+)(?:(?:-)([0-9]+))?\](.*)$")
+        m = pattern_re.match(pattern)
+        if m:
+            (target, first, last, rest) = m.groups()
+            first = int(first)
+            if last:
+                if first < 0:
+                    raise errors.AnsibleError("invalid range: negative indices cannot be used as the first item in a range")
+                last = int(last)
+            else:
+                last = first
+            return (target, (first, last))
         else:
-            return (first, (rest, rest))
+            return (pattern, None)
 
     def _apply_ranges(self, pat, hosts):
         """
@@ -206,35 +257,69 @@ class Inventory(object):
         given a pattern like foo[0:5], where foo matches hosts, return the first 6 hosts
         """ 
 
+        # If there are no hosts to select from, just return the
+        # empty set. This prevents trying to do selections on an empty set.
+        # issue#6258
+        if not hosts:
+            return hosts
+
         (loose_pattern, limits) = self._enumeration_info(pat)
         if not limits:
             return hosts
 
         (left, right) = limits
-        enumerated = enumerate(hosts)
+
         if left == '':
             left = 0
         if right == '':
             right = 0
         left=int(left)
         right=int(right)
-        enumerated = [ h for (i,h) in enumerated if i>=left and i<=right ]
-        return enumerated
+        try:
+            if left != right:
+                return hosts[left:right]
+            else:
+                return [ hosts[left] ]
+        except IndexError:
+            raise errors.AnsibleError("no hosts matching the pattern '%s' were found" % pat)
 
-    # TODO: cache this logic so if called a second time the result is not recalculated
+    def _create_implicit_localhost(self, pattern):
+        new_host = Host(pattern)
+        new_host.set_variable("ansible_python_interpreter", sys.executable)
+        new_host.set_variable("ansible_connection", "local")
+        ungrouped = self.get_group("ungrouped")
+        if ungrouped is None:
+            self.add_group(Group('ungrouped'))
+            ungrouped = self.get_group('ungrouped')
+        ungrouped.add_host(new_host)
+        return new_host
+
     def _hosts_in_unenumerated_pattern(self, pattern):
         """ Get all host names matching the pattern """
 
-        hosts = {}
+        hosts = []
+        hostnames = set()
+
         # ignore any negative checks here, this is handled elsewhere
         pattern = pattern.replace("!","").replace("&", "")
 
+        results = []
         groups = self.get_groups()
         for group in groups:
             for host in group.get_hosts():
                 if pattern == 'all' or self._match(group.name, pattern) or self._match(host.name, pattern):
-                    hosts[host.name] = host
-        return sorted(hosts.values(), key=lambda x: x.name)
+                    if host not in results and host.name not in hostnames:
+                        results.append(host)
+                        hostnames.add(host.name)
+
+        if pattern in ["localhost", "127.0.0.1"] and len(results) == 0:
+            new_host = self._create_implicit_localhost(pattern)
+            results.append(new_host)
+        return results
+
+    def clear_pattern_cache(self):
+        ''' called exclusively by the add_host plugin to allow patterns to be recalculated '''
+        self._pattern_cache = {}
 
     def groups_for_host(self, host):
         results = []
@@ -271,6 +356,7 @@ class Inventory(object):
             for host in self.get_group('all').get_hosts():
                 if host.name in ['localhost', '127.0.0.1']:
                     return host
+            return self._create_implicit_localhost(hostname)
         else:
             for group in self.groups:
                 for host in group.get_hosts():
@@ -295,26 +381,26 @@ class Inventory(object):
             raise Exception("group not found: %s" % groupname)
         return group.get_variables()
 
-    def get_variables(self, hostname):
+    def get_variables(self, hostname, vault_password=None):
         if hostname not in self._vars_per_host:
-            self._vars_per_host[hostname] = self._get_variables(hostname)
+            self._vars_per_host[hostname] = self._get_variables(hostname, vault_password=vault_password)
         return self._vars_per_host[hostname]
 
-    def _get_variables(self, hostname):
+    def _get_variables(self, hostname, vault_password=None):
 
         host = self.get_host(hostname)
         if host is None:
             raise errors.AnsibleError("host not found: %s" % hostname)
 
         vars = {}
-        vars_results = [ plugin.run(host) for plugin in self._vars_plugins ] 
+        vars_results = [ plugin.run(host, vault_password=vault_password) for plugin in self._vars_plugins ] 
         for updated in vars_results:
             if updated is not None:
-                vars.update(updated)
+                vars = utils.combine_vars(vars, updated)
 
-        vars.update(host.get_variables())
+        vars = utils.combine_vars(vars, host.get_variables())
         if self.parser is not None:
-            vars.update(self.parser.get_host_variables(host))
+            vars = utils.combine_vars(vars, self.parser.get_host_variables(host))
         return vars
 
     def add_group(self, group):
@@ -322,7 +408,13 @@ class Inventory(object):
         self._groups_list = None  # invalidate internal cache 
 
     def list_hosts(self, pattern="all"):
-        return [ h.name for h in self.get_hosts(pattern) ]
+
+        """ return a list of hostnames for a pattern """
+
+        result = [ h.name for h in self.get_hosts(pattern) ]
+        if len(result) == 0 and pattern in ["localhost", "127.0.0.1"]:
+            result = [pattern]
+        return result
 
     def list_groups(self):
         return sorted([ g.name for g in self.groups ], key=lambda x: x)
@@ -394,8 +486,8 @@ class Inventory(object):
         dname = os.path.dirname(self.host_list)
         if dname is None or dname == '' or dname == '.':
             cwd = os.getcwd()
-            return cwd 
-        return dname
+            return os.path.abspath(cwd) 
+        return os.path.abspath(dname)
 
     def src(self):
         """ if inventory came from a file, what's the directory and file name? """

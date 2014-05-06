@@ -1,4 +1,4 @@
-# (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -23,8 +23,10 @@ from ansible.inventory.group import Group
 from ansible.inventory.expand_hosts import detect_range
 from ansible.inventory.expand_hosts import expand_hostname_range
 from ansible import errors
+from ansible import utils
 import shlex
 import re
+import ast
 
 class InventoryParser(object):
     """
@@ -46,6 +48,20 @@ class InventoryParser(object):
         self._parse_group_variables()
         return self.groups
 
+    @staticmethod
+    def _parse_value(v):
+        if "#" not in v:
+            try:
+                return ast.literal_eval(v)
+            # Using explicit exceptions.
+            # Likely a string that literal_eval does not like. We wil then just set it.
+            except ValueError:
+                # For some reason this was thought to be malformed.
+                pass
+            except SyntaxError:
+                # Is this a hash with an equals at the end?
+                pass
+        return v
 
     # [webservers]
     # alpha
@@ -64,9 +80,10 @@ class InventoryParser(object):
         active_group_name = 'ungrouped'
 
         for line in self.lines:
-            if line.startswith("["):
-                active_group_name = line.split(" #")[0].replace("[","").replace("]","").strip()
-                if line.find(":vars") != -1 or line.find(":children") != -1:
+            line = utils.before_comment(line).strip()
+            if line.startswith("[") and line.endswith("]"):
+                active_group_name = line.replace("[","").replace("]","")
+                if ":vars" in line or ":children" in line:
                     active_group_name = active_group_name.rsplit(":", 1)[0]
                     if active_group_name not in self.groups:
                         new_group = self.groups[active_group_name] = Group(name=active_group_name)
@@ -75,25 +92,29 @@ class InventoryParser(object):
                 elif active_group_name not in self.groups:
                     new_group = self.groups[active_group_name] = Group(name=active_group_name)
                     all.add_child_group(new_group)
-            elif line.startswith("#") or line.startswith(";") or line == '':
+            elif line.startswith(";") or line == '':
                 pass
             elif active_group_name:
-                tokens = shlex.split(line.split(" #")[0])
+                tokens = shlex.split(line)
                 if len(tokens) == 0:
                     continue
                 hostname = tokens[0]
                 port = C.DEFAULT_REMOTE_PORT
-                # Two cases to check:
+                # Three cases to check:
                 # 0. A hostname that contains a range pesudo-code and a port
                 # 1. A hostname that contains just a port
-                if (hostname.find("[") != -1 and
-                    hostname.find("]") != -1 and
-                    hostname.find(":") != -1 and
+                if hostname.count(":") > 1:
+                    # Possible an IPv6 address, or maybe a host line with multiple ranges
+                    # IPv6 with Port  XXX:XXX::XXX.port
+                    # FQDN            foo.example.com
+                    if hostname.count(".") == 1:
+                        (hostname, port) = hostname.rsplit(".", 1)
+                elif ("[" in hostname and
+                    "]" in hostname and
+                    ":" in hostname and
                     (hostname.rindex("]") < hostname.rindex(":")) or
-                    (hostname.find("]") == -1 and hostname.find(":") != -1)):
-                        tokens2  = hostname.rsplit(":", 1)
-                        hostname = tokens2[0]
-                        port     = tokens2[1]
+                    ("]" not in hostname and ":" in hostname)):
+                        (hostname, port) = hostname.rsplit(":", 1)
 
                 hostnames = []
                 if detect_range(hostname):
@@ -113,10 +134,10 @@ class InventoryParser(object):
                             if t.startswith('#'):
                                 break
                             try:
-                                (k,v) = t.split("=")
+                                (k,v) = t.split("=", 1)
                             except ValueError, e:
                                 raise errors.AnsibleError("Invalid ini entry: %s - %s" % (t, str(e)))
-                            host.set_variable(k,v)
+                            host.set_variable(k, self._parse_value(v))
                     self.groups[active_group_name].add_host(host)
 
     # [southeast:children]
@@ -130,7 +151,7 @@ class InventoryParser(object):
             line = line.strip()
             if line is None or line == '':
                 continue
-            if line.startswith("[") and line.find(":children]") != -1:
+            if line.startswith("[") and ":children]" in line:
                 line = line.replace("[","").replace(":children]","")
                 group = self.groups.get(line, None)
                 if group is None:
@@ -155,7 +176,7 @@ class InventoryParser(object):
         group = None
         for line in self.lines:
             line = line.strip()
-            if line.startswith("[") and line.find(":vars]") != -1:
+            if line.startswith("[") and ":vars]" in line:
                 line = line.replace("[","").replace(":vars]","")
                 group = self.groups.get(line, None)
                 if group is None:
@@ -167,16 +188,11 @@ class InventoryParser(object):
             elif line == '':
                 pass
             elif group:
-                if line.find("=") == -1:
+                if "=" not in line:
                     raise errors.AnsibleError("variables assigned to group must be in key=value form")
                 else:
                     (k, v) = [e.strip() for e in line.split("=", 1)]
-                    # When the value is a single-quoted or double-quoted string
-                    if re.match(r"^(['\"]).*\1$", v):
-                        # Unquote the string
-                        group.set_variable(k, re.sub(r"^['\"]|['\"]$", '', v))
-                    else:
-                        group.set_variable(k, v)
+                    group.set_variable(k, self._parse_value(v))
 
     def get_host_variables(self, host):
         return {}

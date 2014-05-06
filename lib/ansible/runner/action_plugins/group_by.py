@@ -28,7 +28,7 @@ class ActionModule(object):
 
     ### We need to be able to modify the inventory
     BYPASS_HOST_LOOP = True
-    NEEDS_TMPPATH = False
+    TRANSFERS_FILES = False
 
     def __init__(self, runner):
         self.runner = runner
@@ -41,7 +41,7 @@ class ActionModule(object):
         args = {}
         if complex_args:
             args.update(complex_args)
-        args.update(parse_kv(self.runner.module_args))
+        args.update(parse_kv(module_args))
         if not 'key' in args:
             raise ae("'key' is a required argument.")
 
@@ -61,9 +61,13 @@ class ActionModule(object):
             conds = self.runner.conditional
             if type(conds) != list:
                 conds = [ conds ]
+            next_host = False
             for cond in conds:
                 if not check_conditional(cond, self.runner.basedir, data, fail_on_undefined=self.runner.error_on_undefined_vars):
-                    continue
+                    next_host = True
+                    break
+            if next_host:
+                continue
             group_name = template.template(self.runner.basedir, args['key'], data)
             group_name = group_name.replace(' ','-')
             if group_name not in groups:
@@ -79,7 +83,8 @@ class ActionModule(object):
                 inv_group = ansible.inventory.Group(name=group)
                 inventory.add_group(inv_group)
             for host in hosts:
-                del self.runner.inventory._vars_per_host[host]
+                if host in self.runner.inventory._vars_per_host:
+                    del self.runner.inventory._vars_per_host[host]
                 inv_host = inventory.get_host(host)
                 if not inv_host:
                     inv_host = ansible.inventory.Host(name=host)

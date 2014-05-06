@@ -72,7 +72,7 @@ if len(sys.argv) < 3:
     })
     sys.exit(1)
 
-jid = sys.argv[1]
+jid = "%s.%d" % (sys.argv[1], os.getpid())
 time_limit = sys.argv[2]
 wrapped_module = sys.argv[3]
 argsfile = sys.argv[4]
@@ -180,7 +180,7 @@ try:
                 debug("%s still running (%s)"%(sub_pid, remaining))
                 time.sleep(5)
                 remaining = remaining - 5
-                if remaining == 0:
+                if remaining <= 0:
                     debug("Now killing %s"%(sub_pid))
                     os.killpg(sub_pid, signal.SIGKILL)
                     debug("Sent kill to group %s"%sub_pid)

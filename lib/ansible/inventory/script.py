@@ -1,4 +1,4 @@
-# (c) 2012, Michael DeHaan <michael.dehaan@gmail.com>
+# (c) 2012-2014, Michael DeHaan <michael.dehaan@gmail.com>
 #
 # This file is part of Ansible
 #
@@ -72,7 +72,10 @@ class InventoryScript(object):
                     self.host_vars_from_top = data['hostvars']
                     continue
 
-            group = groups[group_name] = Group(group_name)
+            if group_name != all.name:
+                group = groups[group_name] = Group(group_name)
+            else:
+                group = all
             host = None
 
             if not isinstance(data, dict):
@@ -110,7 +113,7 @@ class InventoryScript(object):
     def get_host_variables(self, host):
         """ Runs <script> --host <hostname> to determine additional host variables """
         if self.host_vars_from_top is not None:
-            got = self.host_vars_from_top.get(host, {})
+            got = self.host_vars_from_top.get(host.name, {})
             return got
 
 

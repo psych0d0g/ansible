@@ -55,6 +55,7 @@ options:
       - erlang node name of the rabbit we wish to configure
     required: false
     default: rabbit
+    version_added: "1.2"
   configure_priv:
     description:
       - Regular expression to restrict configure actions on a resource
@@ -243,6 +244,6 @@ def main():
 
     module.exit_json(changed=changed, user=username, state=state)
 
-# this is magic, see lib/ansible/module_common.py
-#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+# import module snippets
+from ansible.module_utils.basic import *
 main()

@@ -39,6 +39,7 @@ options:
       - erlang node name of the rabbit we wish to configure
     required: false
     default: rabbit
+    version_added: "1.2"
   tracing:
     description:
       - Enable/disable tracing for a vhost
@@ -141,6 +142,6 @@ def main():
 
     module.exit_json(changed=changed, name=name, state=state)
 
-# this is magic, see lib/ansible/module_common.py
-#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+# import module snippets
+from ansible.module_utils.basic import *
 main()
